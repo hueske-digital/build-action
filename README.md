@@ -15,7 +15,7 @@ on:
 
 jobs:
   build:
-    uses: hueske-digital/build-action/.github/workflows/build.yml@<commit> # v1.0.0
+    uses: hueske-digital/build-action/.github/workflows/build.yml@4375a3e0cc6dcf85214e8b320c9c74a465485d79 # v1.0.0
     permissions:
       contents: read
       packages: write

@@ -31,12 +31,18 @@ jobs:
       platforms: linux/arm64
       push: false
 
-  # The pushed image holds both platforms, each built on its own
-  # architecture, under the tags and the digest the workflow names.
+  # The pushed image holds both platforms under the tags and the digest the
+  # workflow names, and each runs on a runner of its architecture as what
+  # it was built for.
   check:
     if: github.event_name == 'push'
     needs: both
-    runs-on: ubuntu-26.04
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, machine: x86_64, runner: ubuntu-26.04 }
+          - { arch: arm64, machine: aarch64, runner: ubuntu-26.04-arm }
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -50,14 +56,14 @@ jobs:
       - env:
           IMAGE: ${{ needs.both.outputs.image }}
           DIGEST: ${{ needs.both.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+          MACHINE: ${{ matrix.machine }}
         run: |
           set -euo pipefail
           for tag in latest "sha-${GITHUB_SHA::7}"; do
             [ "$(docker buildx imagetools inspect --raw "$IMAGE:$tag" | sha256sum | cut -d' ' -f1)" = "${DIGEST#sha256:}" ]
           done
           [ "$(docker buildx imagetools inspect --raw "$IMAGE@$DIGEST" | jq -r '[.manifests[].platform | select(.os == "linux") | .architecture] | sort | join(",")')" = amd64,arm64 ]
-          for arch in amd64 arm64; do
-            out=$(docker run --rm --platform "linux/$arch" "$IMAGE@$DIGEST")
-            echo "$arch: $out"
-            case $arch:$out in amd64:"hello x86_64"|arm64:"hello aarch64") ;; *) exit 1 ;; esac
-          done
+          out=$(docker run --rm --platform "linux/$ARCH" "$IMAGE@$DIGEST")
+          echo "$ARCH: $out"
+          [ "$out" = "hello $MACHINE" ]

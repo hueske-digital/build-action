@@ -1,0 +1,63 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Both platforms from test/, pushed on main as this repository's image,
+  # built only for a pull request.
+  both:
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      context: test
+      build-args: GREETING=hello
+      push: ${{ github.event_name == 'push' }}
+
+  # One platform, without pushing.
+  arm64:
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+    with:
+      context: test
+      platforms: linux/arm64
+      push: false
+
+  # The pushed image holds both platforms, each built on its own
+  # architecture, under the tags and the digest the workflow names.
+  check:
+    if: github.event_name == 'push'
+    needs: both
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - env:
+          IMAGE: ${{ needs.both.outputs.image }}
+          DIGEST: ${{ needs.both.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for tag in latest "sha-${GITHUB_SHA::7}"; do
+            [ "$(docker buildx imagetools inspect --raw "$IMAGE:$tag" | sha256sum | cut -d' ' -f1)" = "${DIGEST#sha256:}" ]
+          done
+          [ "$(docker buildx imagetools inspect --raw "$IMAGE@$DIGEST" | jq -r '[.manifests[].platform | select(.os == "linux") | .architecture] | sort | join(",")')" = amd64,arm64 ]
+          for arch in amd64 arm64; do
+            out=$(docker run --rm --platform "linux/$arch" "$IMAGE@$DIGEST")
+            echo "$arch: $out"
+            case $arch:$out in amd64:"hello x86_64"|arm64:"hello aarch64") ;; *) exit 1 ;; esac
+          done

@@ -31,6 +31,48 @@ jobs:
       platforms: linux/arm64
       push: false
 
+  # One platform, pushed on main as an image of its own: the build job tags
+  # it itself, without a merge job.
+  single:
+    uses: ./.github/workflows/build.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      image: ghcr.io/${{ github.repository }}-single
+      context: test
+      platforms: linux/arm64
+      build-args: GREETING=hello
+      push: ${{ github.event_name == 'push' }}
+
+  # The single platform's image is under the tags and the digest the workflow
+  # names, and runs as what it was built for.
+  check-single:
+    if: github.event_name == 'push'
+    needs: single
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - env:
+          IMAGE: ${{ needs.single.outputs.image }}
+          DIGEST: ${{ needs.single.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for tag in latest "sha-${GITHUB_SHA::7}"; do
+            [ "$(docker buildx imagetools inspect --raw "$IMAGE:$tag" | sha256sum | cut -d' ' -f1)" = "${DIGEST#sha256:}" ]
+          done
+          out=$(docker run --rm --platform linux/arm64 "$IMAGE@$DIGEST")
+          echo "$out"
+          [ "$out" = "hello aarch64" ]
+
   # The pushed image holds both platforms under the tags and the digest the
   # workflow names, and each runs on a runner of its architecture as what
   # it was built for.

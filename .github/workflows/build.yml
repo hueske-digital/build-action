@@ -1,8 +1,10 @@
 # Builds a repository's image for each platform in parallel, each on a
 # runner of its own architecture, and joins them into one image on ghcr.io:
-#   setup   the platforms as a matrix
+#   setup   the platforms as a matrix, the tags
 #   build   one job per platform, pushed by digest only
 #   merge   the digests as one image with its tags
+# A single platform has nothing to join: its build job pushes the image
+# under its tags itself and merge is skipped.
 # The caller grants contents: read and, to push, packages: write (README).
 name: build
 
@@ -43,7 +45,7 @@ on:
         value: ${{ jobs.setup.outputs.image }}
       digest:
         description: The digest of the pushed image (its index), empty without push.
-        value: ${{ jobs.merge.outputs.digest }}
+        value: ${{ jobs.merge.outputs.digest || jobs.build.outputs.digest }}
 
 jobs:
   setup:
@@ -52,6 +54,8 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       image: ${{ steps.matrix.outputs.image }}
+      single: ${{ steps.matrix.outputs.single }}
+      refs: ${{ steps.matrix.outputs.refs }}
     steps:
       # Every input reaches the shell through the environment, never as
       # text of the script.
@@ -59,6 +63,7 @@ jobs:
         env:
           PLATFORMS: ${{ inputs.platforms }}
           IMAGE: ${{ inputs.image }}
+          TAGS: ${{ inputs.tags }}
         run: |
           set -euo pipefail
           image=${IMAGE:-ghcr.io/${GITHUB_REPOSITORY,,}}
@@ -78,8 +83,27 @@ jobs:
             include=$(jq -c --arg p "$p" --arg r "$runner" '. + [{platform: $p, arch: ($p | split("/")[1]), runner: $r}] | unique' <<< "$include")
           done
           [ "$include" != '[]' ] || { echo "::error::no platform"; exit 1; }
+          tags=("sha-${GITHUB_SHA::7}")
+          if [ -n "$TAGS" ]; then
+            while IFS= read -r t; do [ -z "$t" ] || tags+=("$t"); done <<< "$TAGS"
+          else
+            tags+=(latest)
+            [ "$GITHUB_REF_TYPE" != tag ] || tags+=("$GITHUB_REF_NAME")
+          fi
+          refs=()
+          for t in "${tags[@]}"; do
+            # An image tag: letters, digits, _ . - and at most 128 of them.
+            if ! [[ $t =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+              echo "::error::$t is no image tag"
+              exit 1
+            fi
+            refs+=("$image:$t")
+          done
           echo "matrix={\"include\":$include}" >> "$GITHUB_OUTPUT"
           echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "single=$(jq -r 'length == 1' <<< "$include")" >> "$GITHUB_OUTPUT"
+          # image:tag for every tag, sha-<commit> first, separated by commas.
+          (IFS=,; echo "refs=${refs[*]}") >> "$GITHUB_OUTPUT"
 
   build:
     needs: setup
@@ -87,6 +111,9 @@ jobs:
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    outputs:
+      # Only a single platform's digest is the image's; of several, merge names it.
+      digest: ${{ inputs.push && needs.setup.outputs.single == 'true' && steps.build.outputs.digest || '' }}
     steps:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - if: inputs.push
@@ -106,13 +133,16 @@ jobs:
           platforms: ${{ matrix.platform }}
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
-          outputs: ${{ inputs.push && format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', needs.setup.outputs.image) || 'type=cacheonly' }}
+          # A single platform is pushed under its tags at once; of several, each
+          # by its digest only, for merge to join.
+          tags: ${{ inputs.push && needs.setup.outputs.single == 'true' && needs.setup.outputs.refs || '' }}
+          outputs: ${{ !inputs.push && 'type=cacheonly' || needs.setup.outputs.single == 'true' && 'type=image,push=true' || format('type=image,name={0},push-by-digest=true,name-canonical=true,push=true', needs.setup.outputs.image) }}
       # Jobs share no files: each digest goes to merge as an artifact.
-      - if: inputs.push
+      - if: inputs.push && needs.setup.outputs.single != 'true'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: mkdir digests && touch "digests/${DIGEST#sha256:}"
-      - if: inputs.push
+      - if: inputs.push && needs.setup.outputs.single != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: digests-${{ matrix.arch }}
@@ -121,7 +151,7 @@ jobs:
           retention-days: 1
 
   merge:
-    if: inputs.push
+    if: inputs.push && needs.setup.outputs.single != 'true'
     needs: [setup, build]
     runs-on: ubuntu-26.04
     timeout-minutes: 10
@@ -143,26 +173,13 @@ jobs:
         working-directory: digests
         env:
           IMAGE: ${{ needs.setup.outputs.image }}
-          TAGS: ${{ inputs.tags }}
+          REFS: ${{ needs.setup.outputs.refs }}
         run: |
           set -euo pipefail
-          tags=("sha-${GITHUB_SHA::7}")
-          if [ -n "$TAGS" ]; then
-            while IFS= read -r t; do [ -z "$t" ] || tags+=("$t"); done <<< "$TAGS"
-          else
-            tags+=(latest)
-            [ "$GITHUB_REF_TYPE" != tag ] || tags+=("$GITHUB_REF_NAME")
-          fi
+          IFS=',' read -ra refs <<< "$REFS"
           args=()
-          for t in "${tags[@]}"; do
-            # An image tag: letters, digits, _ . - and at most 128 of them.
-            if ! [[ $t =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
-              echo "::error::$t is no image tag"
-              exit 1
-            fi
-            args+=(-t "$IMAGE:$t")
-          done
+          for ref in "${refs[@]}"; do args+=(-t "$ref"); done
           sources=()
           for digest in *; do sources+=("$IMAGE@sha256:$digest"); done
           docker buildx imagetools create "${args[@]}" "${sources[@]}"
-          echo "digest=$(docker buildx imagetools inspect --raw "$IMAGE:${tags[0]}" | sha256sum | cut -d' ' -f1 | sed 's/^/sha256:/')" >> "$GITHUB_OUTPUT"
+          echo "digest=$(docker buildx imagetools inspect --raw "${refs[0]}" | sha256sum | cut -d' ' -f1 | sed 's/^/sha256:/')" >> "$GITHUB_OUTPUT"

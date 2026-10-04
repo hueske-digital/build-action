@@ -37,7 +37,9 @@ jobs:
 
 It runs three jobs: `setup` turns `platforms` into one build job each,
 `build` builds and pushes each platform by its digest only, and `merge`
-joins the digests into one image under its tags. The caller grants
+joins the digests into one image under its tags. A single platform has
+nothing to join: its `build` job pushes the image under its tags itself and
+`merge` is skipped. The caller grants
 `contents: read` and, to push, `packages: write`; the workflow asks for
 nothing itself, so that a build without push runs with `contents: read`
 alone.
@@ -66,4 +68,5 @@ The tests (`.github/workflows/test.yml`) build `test/Dockerfile` for both
 platforms and for arm64 alone; on main they push it as this repository's
 image and check that it holds both platforms, each built on its own
 architecture, under `latest`, `sha-<commit>` and the digest the workflow
-names.
+names. The image for arm64 alone is pushed as `<repository>-single` and
+checked the same way.
